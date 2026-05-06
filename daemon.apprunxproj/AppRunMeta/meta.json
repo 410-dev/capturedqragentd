@@ -1,0 +1,6 @@
+{
+    "name":               "Captured QR Agent Daemon",
+    "version":            "1.0.0",
+    "type":               "Application",
+    "apt-requirements":   ["python3-gi", "gir1.2-gtk-4.0", "gir1.2-glib-2.0", "zbar-tools", "libzbar0t64", "wl-clipboard", "xclip", "xdg-utils"]
+}

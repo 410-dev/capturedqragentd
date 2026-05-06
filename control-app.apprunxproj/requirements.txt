@@ -1,0 +1,2 @@
+# Runtime system package needed for the GTK configurator:
+# - PyGObject / python3-gi
