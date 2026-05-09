@@ -3,9 +3,11 @@ from __future__ import annotations
 from AppContext import AppContext
 
 import argparse
+import importlib.util
 import json
 import os
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +28,8 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "scan_existing_on_start": False,
 }
 
-VALID_DETECTION_METHODS = {"gio", "inotify", "clipboard"}
+VALID_DETECTION_METHODS = {"gio", "inotify", "clipboardd", "clipboard_tools"}
+CLIPBOARDD_PROCESS_NAME = "clipboardd"
 
 
 def xdg_config_home() -> Path:
@@ -38,6 +41,55 @@ def xdg_config_home() -> Path:
 
 def settings_path() -> Path:
     return xdg_config_home() / APP_ID / "settings.json"
+
+
+def module_available(module_name: str) -> bool:
+    try:
+        return importlib.util.find_spec(module_name) is not None
+    except ModuleNotFoundError:
+        return False
+
+
+def normalize_detection_methods(methods: Any) -> list[str]:
+    if isinstance(methods, str):
+        methods = [methods]
+    normalized: list[str] = []
+    for method in methods if isinstance(methods, list) else []:
+        if not isinstance(method, str):
+            continue
+        candidate = "clipboardd" if method == "clipboard" else method
+        if candidate in VALID_DETECTION_METHODS and candidate not in normalized:
+            normalized.append(candidate)
+    return normalized or ["gio"]
+
+
+def clipboardd_available(timeout: float = 0.75) -> bool:
+    if not module_available("oscore.libipc"):
+        return False
+
+    try:
+        from oscore.libipc import send
+    except ImportError:
+        return False
+
+    result: dict[str, Any] = {}
+
+    def ping() -> None:
+        try:
+            result["value"] = send(CLIPBOARDD_PROCESS_NAME, -1, "ping", {}, dict, timeout=timeout)
+        except TypeError:
+            result["value"] = send(CLIPBOARDD_PROCESS_NAME, -1, "ping", {}, dict)
+        except Exception as error:
+            result["error"] = error
+
+    thread = threading.Thread(target=ping, name="captured-qr-agent-clipboardd-ping", daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive() or "error" in result:
+        return False
+
+    value = result.get("value")
+    return isinstance(value, dict) and bool(value.get("ok"))
 
 
 def read_user_dirs() -> dict[str, Path]:
@@ -92,14 +144,7 @@ def load_settings() -> dict[str, Any]:
     if not settings.get("watch_dirs"):
         settings["watch_dirs"] = default_watch_dirs()
 
-    methods = settings.get("detection_methods", ["gio"])
-    if isinstance(methods, str):
-        methods = [methods]
-    settings["detection_methods"] = [
-        method
-        for method in methods
-        if isinstance(method, str) and method in VALID_DETECTION_METHODS
-    ] or ["gio"]
+    settings["detection_methods"] = normalize_detection_methods(settings.get("detection_methods", ["gio"]))
 
     try:
         settings["clipboard_poll_interval_seconds"] = max(
@@ -165,7 +210,7 @@ def run_gui(args: list[str]) -> int:
             self.context = AppContext()
             self.settings = load_settings()
 
-            self.set_default_size(620, 560)
+            self.set_default_size(620, 540)
             self.context.update_icon(self)
 
             root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
@@ -213,13 +258,11 @@ def run_gui(args: list[str]) -> int:
             self.inotify_check.set_active("inotify" in methods)
             box_append(root, self.inotify_check)
 
-            self.clipboard_check = Gtk.CheckButton(label="Watch clipboard for copied screenshot images")
-            self.clipboard_check.set_active("clipboard" in methods)
-            box_append(root, self.clipboard_check)
-
-            self.clipboard_interval_entry = Gtk.Entry()
-            self.clipboard_interval_entry.set_text(str(self.settings.get("clipboard_poll_interval_seconds", 1.0)))
-            box_append(root, self._row("Clipboard fallback poll seconds", self.clipboard_interval_entry))
+            self.clipboardd_available = clipboardd_available()
+            self.clipboardd_check = Gtk.CheckButton(label="Watch clipboard via clipboardd")
+            self.clipboardd_check.set_active("clipboardd" in methods)
+            self.clipboardd_check.set_sensitive(self.clipboardd_available)
+            box_append(root, self.clipboardd_check)
 
             self.schemes_entry = Gtk.Entry()
             self.schemes_entry.set_text(", ".join(self.settings.get("open_url_schemes", [])))
@@ -279,15 +322,13 @@ def run_gui(args: list[str]) -> int:
                 methods.append("gio")
             if self.inotify_check.get_active():
                 methods.append("inotify")
-            if self.clipboard_check.get_active():
-                methods.append("clipboard")
+            if self.clipboardd_check.get_active() and (
+                self.clipboardd_available or "clipboardd" in self.settings.get("detection_methods", [])
+            ):
+                methods.append("clipboardd")
+            if "clipboard_tools" in self.settings.get("detection_methods", []):
+                methods.append("clipboard_tools")
             return methods or ["gio"]
-
-        def _read_clipboard_interval(self) -> float:
-            try:
-                return max(0.25, float(self.clipboard_interval_entry.get_text()))
-            except ValueError:
-                return 1.0
 
         def _on_save(self, _button) -> None:
             settings = DEFAULT_SETTINGS.copy()
@@ -298,7 +339,7 @@ def run_gui(args: list[str]) -> int:
                     "copy_after_open": self.copy_after_open_check.get_active(),
                     "scan_existing_on_start": self.scan_existing_check.get_active(),
                     "detection_methods": self._read_detection_methods(),
-                    "clipboard_poll_interval_seconds": self._read_clipboard_interval(),
+                    "clipboard_poll_interval_seconds": self.settings.get("clipboard_poll_interval_seconds", 1.0),
                     "watch_dirs": self._read_dirs(),
                     "open_url_schemes": self._read_schemes(),
                 }

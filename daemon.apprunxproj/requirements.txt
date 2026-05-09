@@ -2,6 +2,7 @@ opencv-python-headless>=4.8
 
 # Runtime system packages are also needed on GNOME:
 # - PyGObject / python3-gi for GIO monitoring and notification actions
-# - wl-clipboard or xclip/xsel for clipboard integration
-# - wl-clipboard for event-driven Wayland clipboard watching
-# - xclip as an X11 clipboard polling fallback
+# - oscore.libipc when using the distro clipboardd service
+# - wl-clipboard or xclip/xsel for manually enabled legacy clipboard integration
+# - wl-clipboard for event-driven Wayland clipboard watching when detection_methods includes "clipboard_tools"
+# - xclip as an X11 clipboard polling option when detection_methods includes "clipboard_tools"

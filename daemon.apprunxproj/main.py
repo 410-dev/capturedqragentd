@@ -3,6 +3,8 @@ from __future__ import annotations
 from AppContext import AppContext, ProcessAlreadyRunningError
 
 import argparse
+import base64
+import binascii
 import ctypes
 import hashlib
 import importlib.util
@@ -28,11 +30,15 @@ from urllib.parse import urlparse
 APP_ID = "captured-qr-agent"
 APP_NAME = "Captured QR Agent"
 SETTINGS_VERSION = 1
-IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".gif"}
 DEFAULT_DETECTION_METHODS = ["gio"]
-VALID_DETECTION_METHODS = {"gio", "inotify", "clipboard"}
-CLIPBOARD_IMAGE_TYPES = ["image/png", "image/jpeg", "image/bmp", "image/webp", "image/tiff"]
+VALID_DETECTION_METHODS = {"gio", "inotify", "clipboardd", "clipboard_tools"}
+CLIPBOARD_IMAGE_TYPES = ["image/png", "image/jpeg", "image/bmp", "image/webp", "image/tiff", "image/gif"]
 CLIPBOARD_WATCH_IMAGE_TYPE = "image/png"
+CLIPBOARDD_PROCESS_NAME = "clipboardd"
+CLIPBOARDD_CLIENT_PROCESS_NAME = "capturedqragentd"
+CLIPBOARDD_CHANGED_IPC_ID = "clipboard_changed"
+CLIPBOARDD_SUPPORTED_IMAGE_TYPES = set(CLIPBOARD_IMAGE_TYPES) | {"image/jpg"}
 
 
 DEFAULT_SETTINGS: dict[str, Any] = {
@@ -143,14 +149,9 @@ def load_settings() -> dict[str, Any]:
         for scheme in settings.get("open_url_schemes", [])
         if isinstance(scheme, str) and scheme.strip()
     ]
-    methods = settings.get("detection_methods", DEFAULT_DETECTION_METHODS)
-    if isinstance(methods, str):
-        methods = [methods]
-    settings["detection_methods"] = [
-        method
-        for method in methods
-        if isinstance(method, str) and method in VALID_DETECTION_METHODS
-    ] or DEFAULT_DETECTION_METHODS
+    settings["detection_methods"] = normalize_detection_methods(
+        settings.get("detection_methods", DEFAULT_DETECTION_METHODS)
+    )
 
     try:
         settings["clipboard_poll_interval_seconds"] = max(
@@ -169,7 +170,23 @@ def save_settings(settings: dict[str, Any]) -> None:
 
 
 def module_available(module_name: str) -> bool:
-    return importlib.util.find_spec(module_name) is not None
+    try:
+        return importlib.util.find_spec(module_name) is not None
+    except ModuleNotFoundError:
+        return False
+
+
+def normalize_detection_methods(methods: Any) -> list[str]:
+    if isinstance(methods, str):
+        methods = [methods]
+    normalized: list[str] = []
+    for method in methods if isinstance(methods, list) else []:
+        if not isinstance(method, str):
+            continue
+        candidate = "clipboardd" if method == "clipboard" else method
+        if candidate in VALID_DETECTION_METHODS and candidate not in normalized:
+            normalized.append(candidate)
+    return normalized or DEFAULT_DETECTION_METHODS
 
 
 def decoder_availability() -> dict[str, bool]:
@@ -182,6 +199,7 @@ def decoder_availability() -> dict[str, bool]:
 
 def clipboard_availability() -> dict[str, bool]:
     return {
+        "clipboardd_libipc": module_available("oscore.libipc"),
         "wl-paste": shutil.which("wl-paste") is not None,
         "wl-copy": shutil.which("wl-copy") is not None,
         "xclip": shutil.which("xclip") is not None,
@@ -200,7 +218,8 @@ def detection_source_availability() -> dict[str, bool]:
     return {
         "gio": module_available("gi"),
         "inotify": sys.platform.startswith("linux"),
-        "clipboard": any(shutil.which(command) is not None for command in ("wl-paste", "xclip")),
+        "clipboardd": module_available("oscore.libipc"),
+        "clipboard_tools": any(shutil.which(command) is not None for command in ("wl-paste", "xclip")),
         "clipboard_watch": bool(os.environ.get("WAYLAND_DISPLAY") and shutil.which("wl-paste")),
     }
 
@@ -276,9 +295,11 @@ def clipboard_image_path(image_data: bytes, image_type: str) -> Path:
     suffix_by_type = {
         "image/png": ".png",
         "image/jpeg": ".jpg",
+        "image/jpg": ".jpg",
         "image/bmp": ".bmp",
         "image/webp": ".webp",
         "image/tiff": ".tiff",
+        "image/gif": ".gif",
     }
     digest = hashlib.sha256(image_data).hexdigest()
     suffix = suffix_by_type.get(image_type, ".img")
@@ -326,6 +347,8 @@ def looks_like_image_data(data: bytes) -> bool:
         data.startswith(b"\x89PNG\r\n\x1a\n")
         or data.startswith(b"\xff\xd8\xff")
         or data.startswith(b"BM")
+        or data.startswith(b"GIF87a")
+        or data.startswith(b"GIF89a")
         or data.startswith(b"RIFF") and b"WEBP" in data[:16]
         or data.startswith(b"II*\x00")
         or data.startswith(b"MM\x00*")
@@ -339,6 +362,8 @@ def image_type_from_data(data: bytes, fallback: str = CLIPBOARD_WATCH_IMAGE_TYPE
         return "image/jpeg"
     if data.startswith(b"BM"):
         return "image/bmp"
+    if data.startswith(b"GIF87a") or data.startswith(b"GIF89a"):
+        return "image/gif"
     if data.startswith(b"RIFF") and b"WEBP" in data[:16]:
         return "image/webp"
     if data.startswith(b"II*\x00") or data.startswith(b"MM\x00*"):
@@ -659,6 +684,11 @@ class ScreenshotMonitor:
         self.notification_center = NotificationCenter(settings, self.log)
         self.processed: dict[str, int] = {}
         self.recent_payloads: set[str] = set()
+        self.clipboardd_subscription_id: str | None = None
+        self.clipboardd_listener_registered = False
+        self.clipboardd_last_digest: str | None = None
+        self.clipboardd_send = None
+        self.clipboardd_remove_listener = None
         self.stop_event = threading.Event()
         self.threads: list[threading.Thread] = []
         self.gio_monitors = []
@@ -710,8 +740,10 @@ class ScreenshotMonitor:
             active_sources += self._start_gio_monitors(valid_dirs)
         if "inotify" in detection_methods:
             active_sources += self._start_inotify_monitor(valid_dirs)
-        if "clipboard" in detection_methods:
-            active_sources += self._start_clipboard_polling()
+        if "clipboardd" in detection_methods:
+            active_sources += self._start_clipboardd_subscription()
+        if "clipboard_tools" in detection_methods:
+            active_sources += self._start_clipboard_tools_monitor()
 
         if active_sources == 0:
             self.log("ERROR", "No detection source could be started.")
@@ -742,6 +774,7 @@ class ScreenshotMonitor:
         finally:
             self.log("INFO", "Daemon shutting down")
             self.stop_event.set()
+            self._stop_clipboardd_subscription()
             self.notification_center.close()
             for thread in self.threads:
                 thread.join(timeout=2)
@@ -790,12 +823,12 @@ class ScreenshotMonitor:
         self.log("INFO", f"inotify monitor started for {len(valid_dirs)} screenshot directories")
         return 1
 
-    def _start_clipboard_polling(self) -> int:
+    def _start_clipboard_tools_monitor(self) -> int:
         if self._start_wayland_clipboard_watch():
             return 1
 
         if not clipboard_image_commands():
-            self.log("ERROR", "Clipboard detection requested, but wl-paste or xclip is unavailable")
+            self.log("ERROR", "Clipboard tools detection requested, but wl-paste and xclip are unavailable")
             return 0
 
         thread = threading.Thread(
@@ -806,8 +839,143 @@ class ScreenshotMonitor:
         thread.start()
         self.threads.append(thread)
         interval = self.settings.get("clipboard_poll_interval_seconds", 1.0)
-        self.log("INFO", f"Clipboard image polling fallback started at {interval:.2f}s interval")
+        self.log("INFO", f"Legacy clipboard image polling started at {interval:.2f}s interval")
         return 1
+
+    def _start_clipboardd_subscription(self) -> bool:
+        try:
+            from oscore.libipc import add_listener, remove_listener, send
+        except ImportError as error:
+            self.log("INFO", f"clipboardd integration unavailable because oscore.libipc is missing: {error}")
+            return False
+
+        try:
+            add_listener(
+                CLIPBOARDD_CLIENT_PROCESS_NAME,
+                CLIPBOARDD_CHANGED_IPC_ID,
+                self._on_clipboardd_changed,
+                dict,
+            )
+            self.clipboardd_listener_registered = True
+            self.clipboardd_remove_listener = remove_listener
+            self.clipboardd_send = send
+
+            subscription = self._send_clipboardd(
+                "subscribe",
+                {
+                    "name": f"{APP_NAME} clipboard image watcher",
+                    "forward_dest": {
+                        "process_name": CLIPBOARDD_CLIENT_PROCESS_NAME,
+                        "pid": os.getpid(),
+                        "ipc_id": CLIPBOARDD_CHANGED_IPC_ID,
+                    },
+                },
+            )
+            subscription_id = subscription.get("subscription_id") if isinstance(subscription, dict) else None
+            if not subscription_id:
+                raise RuntimeError(f"clipboardd subscribe returned no subscription id: {subscription!r}")
+
+            self.clipboardd_subscription_id = str(subscription_id)
+            self.log("INFO", f"clipboardd subscription started: {self.clipboardd_subscription_id}")
+            self._scan_clipboardd_latest()
+            return True
+        except Exception as error:
+            self.log("ERROR", f"clipboardd subscription unavailable: {error}")
+            self._stop_clipboardd_subscription()
+            return False
+
+    def _send_clipboardd(self, ipc_id: str, data: dict[str, Any]) -> Any:
+        if self.clipboardd_send is None:
+            raise RuntimeError("clipboardd send function is not initialized")
+        try:
+            return self.clipboardd_send(CLIPBOARDD_PROCESS_NAME, -1, ipc_id, data, dict, timeout=2.0)
+        except TypeError:
+            return self.clipboardd_send(CLIPBOARDD_PROCESS_NAME, -1, ipc_id, data, dict)
+
+    def _stop_clipboardd_subscription(self) -> None:
+        if self.clipboardd_subscription_id and self.clipboardd_send is not None:
+            subscription_id = self.clipboardd_subscription_id
+            self.clipboardd_subscription_id = None
+            try:
+                self._send_clipboardd("unsubscribe", {"subscription_id": subscription_id})
+                self.log("INFO", f"clipboardd subscription stopped: {subscription_id}")
+            except Exception as error:
+                self.log("ERROR", f"Failed to unsubscribe from clipboardd: {error}")
+
+        if self.clipboardd_listener_registered and self.clipboardd_remove_listener is not None:
+            self.clipboardd_listener_registered = False
+            try:
+                self.clipboardd_remove_listener(CLIPBOARDD_CHANGED_IPC_ID)
+            except Exception as error:
+                self.log("ERROR", f"Failed to remove clipboardd listener: {error}")
+
+    def _scan_clipboardd_latest(self) -> None:
+        try:
+            latest = self._send_clipboardd("get", {})
+        except Exception as error:
+            self.log("DEBUG", f"Could not fetch latest clipboardd value: {error}")
+            return
+
+        if isinstance(latest, dict) and latest.get("has_value"):
+            self._handle_clipboardd_payload(latest, reason="clipboardd-latest")
+
+    def _on_clipboardd_changed(self, _from_info, data: dict) -> None:
+        self._handle_clipboardd_payload(data, reason="clipboardd")
+
+    def _handle_clipboardd_payload(self, data: dict, reason: str) -> None:
+        if not isinstance(data, dict):
+            self.log("ERROR", f"clipboardd emitted invalid payload type: {type(data).__name__}")
+            return
+        if data.get("kind") != "image":
+            self.log("DEBUG", f"clipboardd ignored non-image clipboard payload: {data.get('kind')}")
+            return
+
+        image_type = str(data.get("mime_type") or "").lower()
+        if image_type == "image/jpg":
+            image_type = "image/jpeg"
+        if image_type not in CLIPBOARDD_SUPPORTED_IMAGE_TYPES:
+            self.log("INFO", f"clipboardd image MIME type is not supported for QR scanning: {image_type}")
+            return
+
+        encoded = data.get("data_b64")
+        if not isinstance(encoded, str) or not encoded:
+            self.log("ERROR", "clipboardd image payload did not include data_b64")
+            return
+
+        try:
+            image_data = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error) as error:
+            self.log("ERROR", f"clipboardd image payload had invalid base64 data: {error}")
+            return
+
+        try:
+            expected_size = int(data.get("size_bytes", len(image_data)))
+        except (TypeError, ValueError):
+            expected_size = len(image_data)
+        if expected_size != len(image_data):
+            self.log(
+                "ERROR",
+                f"clipboardd image payload size mismatch: expected={expected_size}, actual={len(image_data)}",
+            )
+            return
+        if not looks_like_image_data(image_data):
+            self.log("ERROR", f"clipboardd image payload did not look like a supported image: {image_type}")
+            return
+
+        digest = hashlib.sha256(image_data).hexdigest()
+        if digest == self.clipboardd_last_digest:
+            self.log("DEBUG", "clipboardd skipped unchanged image data")
+            return
+        self.clipboardd_last_digest = digest
+
+        try:
+            path = clipboard_image_path(image_data, image_type)
+        except OSError as error:
+            self.log("ERROR", f"Failed to cache clipboardd image for QR scan: {error}")
+            return
+
+        self.log("INFO", f"clipboardd image detected ({image_type}, {len(image_data)} bytes): {path}")
+        self.queue_scan(path, reason=reason)
 
     def _start_wayland_clipboard_watch(self) -> bool:
         if not os.environ.get("WAYLAND_DISPLAY"):
