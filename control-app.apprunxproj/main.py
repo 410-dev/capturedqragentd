@@ -6,8 +6,13 @@ import argparse
 import importlib.util
 import json
 import os
+import re
+import shlex
+import signal
+import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -29,7 +34,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 }
 
 VALID_DETECTION_METHODS = {"gio", "inotify", "clipboardd", "clipboard_tools"}
-CLIPBOARDD_PROCESS_NAME = "clipboardd"
+CLIPBOARDD_PROCESS_NAME = f"clipboardd-{AppContext().username()}"
+DAEMON_PROCESS_NAME = "capturedqragentd"
+DAEMON_STATUS_IPC_ID = "status"
+DAEMON_WAIT_ARGS = ["--wait-for-clipboardd=10"]
 
 
 def xdg_config_home() -> Path:
@@ -63,33 +71,202 @@ def normalize_detection_methods(methods: Any) -> list[str]:
     return normalized or ["gio"]
 
 
-def clipboardd_available(timeout: float = 0.75) -> bool:
+def libipc_safe_name(value: str) -> str:
+    return re.sub(r"[^\w\-.]", "_", value)
+
+
+def libipc_socket_pids(process_name: str, ipc_id: str) -> list[int]:
+    sock_dir = Path(os.environ.get("LIBIPC_SOCK_DIR", "/tmp/libipc"))
+    if not sock_dir.is_dir():
+        return []
+
+    safe_name = libipc_safe_name(process_name)
+    safe_id = libipc_safe_name(ipc_id)
+    pattern = re.compile(rf"^{re.escape(safe_name)}_(\d+)_{re.escape(safe_id)}_.+\.sock$")
+    candidates: list[tuple[float, int]] = []
+    for path in sock_dir.glob(f"{safe_name}_*_{safe_id}_*.sock"):
+        match = pattern.match(path.name)
+        if not match:
+            continue
+        try:
+            pid = int(match.group(1))
+            mtime = path.stat().st_mtime
+        except (OSError, ValueError):
+            continue
+        if process_is_running(pid):
+            candidates.append((mtime, pid))
+
+    candidates.sort(reverse=True)
+    return [pid for _mtime, pid in candidates]
+
+
+def ipc_request(
+    process_name: str,
+    ipc_id: str,
+    data: dict[str, Any] | None = None,
+    timeout: float = 0.75,
+) -> dict[str, Any] | None:
     if not module_available("oscore.libipc"):
-        return False
+        return None
 
     try:
         from oscore.libipc import send
     except ImportError:
-        return False
+        return None
 
     result: dict[str, Any] = {}
+    payload = data or {}
 
-    def ping() -> None:
+    def request() -> None:
+        last_error: Exception | None = None
+        for pid in libipc_socket_pids(process_name, ipc_id):
+            try:
+                result["value"] = send(process_name, pid, ipc_id, payload, dict, timeout=timeout)
+                return
+            except Exception as error:
+                last_error = error
+
         try:
-            result["value"] = send(CLIPBOARDD_PROCESS_NAME, -1, "ping", {}, dict, timeout=timeout)
+            result["value"] = send(process_name, -1, ipc_id, payload, dict, timeout=timeout)
         except TypeError:
-            result["value"] = send(CLIPBOARDD_PROCESS_NAME, -1, "ping", {}, dict)
+            result["value"] = send(process_name, -1, ipc_id, payload, dict)
         except Exception as error:
-            result["error"] = error
+            result["error"] = last_error or error
 
-    thread = threading.Thread(target=ping, name="captured-qr-agent-clipboardd-ping", daemon=True)
+    thread = threading.Thread(target=request, name=f"captured-qr-agent-ipc-{ipc_id}", daemon=True)
     thread.start()
     thread.join(timeout)
     if thread.is_alive() or "error" in result:
-        return False
+        return None
 
     value = result.get("value")
+    return value if isinstance(value, dict) else None
+
+
+def clipboardd_available(timeout: float = 0.75) -> bool:
+    value = ipc_request(CLIPBOARDD_PROCESS_NAME, "ping", timeout=timeout)
     return isinstance(value, dict) and bool(value.get("ok"))
+
+
+def process_is_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def daemon_status(timeout: float = 0.75) -> dict[str, Any] | None:
+    value = ipc_request(DAEMON_PROCESS_NAME, DAEMON_STATUS_IPC_ID, timeout=timeout)
+    if not value or not value.get("ok"):
+        return None
+
+    try:
+        pid = int(value.get("pid"))
+    except (TypeError, ValueError):
+        return None
+
+    if pid <= 0 or not process_is_running(pid):
+        return None
+
+    value["pid"] = pid
+    return value
+
+
+def daemon_status_text(status: dict[str, Any] | None) -> str:
+    if not status:
+        return "Daemon: not responding"
+
+    pid = status.get("pid")
+    started_at = status.get("started_at")
+    if started_at:
+        return f"Daemon: running (PID {pid}, started {started_at})"
+    return f"Daemon: running (PID {pid})"
+
+
+def desktop_exec_command(path: Path) -> list[str] | None:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+
+    for line in lines:
+        if not line.startswith("Exec="):
+            continue
+        command = shlex.split(line.partition("=")[2])
+        command = [part for part in command if not part.startswith("%")]
+        return command or None
+    return None
+
+
+def daemon_start_command() -> list[str] | None:
+    autostart_candidates = [
+        Path.home() / ".config" / "autostart" / "capturedqragentd.desktop",
+        Path("/etc/xdg/autostart/capturedqragentd.desktop"),
+        Path("/usr/share/services.apprd/gui-startup/global/capturedqragentd.desktop"),
+    ]
+    for candidate in autostart_candidates:
+        command = desktop_exec_command(candidate)
+        if command:
+            return command
+
+    packaged_bundle = Path("/usr/share/services.apprd/gui-startup/global/capturedqragentd.apprunx")
+    if packaged_bundle.exists():
+        return ["/usr/bin/apprun3", str(packaged_bundle), *DAEMON_WAIT_ARGS]
+
+    workspace_bundle = Path(__file__).resolve().parents[1] / "capturedqragentd.apprunx"
+    if workspace_bundle.exists():
+        return ["/usr/bin/apprun3", str(workspace_bundle), *DAEMON_WAIT_ARGS]
+
+    workspace_main = Path(__file__).resolve().parents[1] / "daemon.apprunxproj" / "main.py"
+    if workspace_main.exists():
+        return [sys.executable, str(workspace_main), *DAEMON_WAIT_ARGS]
+
+    return None
+
+
+def wait_for_daemon_pid(old_pid: int | None = None, timeout: float = 5.0) -> dict[str, Any] | None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status = daemon_status(timeout=0.5)
+        if status and status.get("pid") != old_pid:
+            return status
+        time.sleep(0.25)
+    return None
+
+
+def restart_daemon() -> tuple[bool, str, dict[str, Any] | None]:
+    old_status = daemon_status(timeout=1.0)
+    old_pid = old_status.get("pid") if old_status else None
+
+    if old_pid:
+        try:
+            os.kill(int(old_pid), signal.SIGTERM)
+        except OSError as error:
+            return False, f"Failed to stop daemon PID {old_pid}: {error}", old_status
+
+        deadline = time.monotonic() + 4.0
+        while time.monotonic() < deadline:
+            current = daemon_status(timeout=0.3)
+            if not current or current.get("pid") != old_pid:
+                break
+            time.sleep(0.2)
+
+    command = daemon_start_command()
+    if not command:
+        return False, "Could not find a command to start capturedqragentd.", None
+
+    try:
+        subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError as error:
+        return False, f"Failed to start daemon: {error}", None
+
+    status = wait_for_daemon_pid(old_pid=int(old_pid) if old_pid else None)
+    if status:
+        return True, f"Daemon restarted (PID {status['pid']}).", status
+    return True, "Daemon start was triggered, but it has not responded over IPC yet.", None
 
 
 def read_user_dirs() -> dict[str, Path]:
@@ -169,16 +346,16 @@ def import_gtk():
     for version in ("4.0", "3.0"):
         try:
             gi.require_version("Gtk", version)
-            from gi.repository import Gtk
+            from gi.repository import GLib, Gtk
 
-            return Gtk, version.startswith("4")
+            return Gtk, GLib, version.startswith("4")
         except (ValueError, ImportError):
             continue
     raise ImportError("GTK 3 or GTK 4 through PyGObject is required.")
 
 
 def run_gui(args: list[str]) -> int:
-    Gtk, gtk4 = import_gtk()
+    Gtk, GLib, gtk4 = import_gtk()
 
     def box_append(box, child, expand: bool = False) -> None:
         if gtk4:
@@ -226,6 +403,10 @@ def run_gui(args: list[str]) -> int:
             path_label.set_xalign(0)
             path_label.set_selectable(True)
             box_append(root, path_label)
+
+            self.daemon_status_label = Gtk.Label(label=daemon_status_text(daemon_status()))
+            self.daemon_status_label.set_xalign(0)
+            box_append(root, self.daemon_status_label)
 
             self.action_combo = Gtk.ComboBoxText()
             for key, label in self.ACTIONS.items():
@@ -287,8 +468,11 @@ def run_gui(args: list[str]) -> int:
             self.save_button.connect("clicked", self._on_save)
             reset_button = Gtk.Button(label="Use Default Folders")
             reset_button.connect("clicked", self._on_defaults)
+            self.restart_button = Gtk.Button(label="Restart Daemon")
+            self.restart_button.connect("clicked", self._on_restart_daemon)
             box_append(button_row, self.save_button)
             box_append(button_row, reset_button)
+            box_append(button_row, self.restart_button)
             box_append(root, button_row)
 
             self.status_label = Gtk.Label(label="")
@@ -351,6 +535,24 @@ def run_gui(args: list[str]) -> int:
         def _on_defaults(self, _button) -> None:
             self.dirs_view.get_buffer().set_text("\n".join(default_watch_dirs()))
             self.status_label.set_text("Default folders loaded. Save to apply them.")
+
+        def _on_restart_daemon(self, _button) -> None:
+            self.restart_button.set_sensitive(False)
+            self.status_label.set_text("Restarting daemon...")
+
+            def worker() -> None:
+                ok, message, status = restart_daemon()
+
+                def finish() -> bool:
+                    self.restart_button.set_sensitive(True)
+                    self.status_label.set_text(message)
+                    self.daemon_status_label.set_text(daemon_status_text(status if ok else daemon_status()))
+                    return False
+
+                GLib.idle_add(finish)
+
+            thread = threading.Thread(target=worker, name="captured-qr-agent-daemon-restart", daemon=True)
+            thread.start()
 
     class SettingsApp(Gtk.Application):
         def __init__(self):

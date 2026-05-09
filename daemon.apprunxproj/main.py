@@ -12,6 +12,7 @@ import json
 import mimetypes
 import os
 import select
+import re
 import shutil
 import signal
 import struct
@@ -27,6 +28,8 @@ from typing import Any, Callable
 from urllib.parse import urlparse
 
 
+context = AppContext()
+
 APP_ID = "captured-qr-agent"
 APP_NAME = "Captured QR Agent"
 SETTINGS_VERSION = 1
@@ -35,8 +38,10 @@ DEFAULT_DETECTION_METHODS = ["gio"]
 VALID_DETECTION_METHODS = {"gio", "inotify", "clipboardd", "clipboard_tools"}
 CLIPBOARD_IMAGE_TYPES = ["image/png", "image/jpeg", "image/bmp", "image/webp", "image/tiff", "image/gif"]
 CLIPBOARD_WATCH_IMAGE_TYPE = "image/png"
-CLIPBOARDD_PROCESS_NAME = "clipboardd"
-CLIPBOARDD_CLIENT_PROCESS_NAME = "capturedqragentd"
+CLIPBOARDD_PROCESS_NAME = f"clipboardd-{context.username()}"
+DAEMON_PROCESS_NAME = "capturedqragentd"
+DAEMON_STATUS_IPC_ID = "status"
+CLIPBOARDD_CLIENT_PROCESS_NAME = DAEMON_PROCESS_NAME
 CLIPBOARDD_CHANGED_IPC_ID = "clipboard_changed"
 CLIPBOARDD_SUPPORTED_IMAGE_TYPES = set(CLIPBOARD_IMAGE_TYPES) | {"image/jpg"}
 
@@ -174,6 +179,45 @@ def module_available(module_name: str) -> bool:
         return importlib.util.find_spec(module_name) is not None
     except ModuleNotFoundError:
         return False
+
+
+def libipc_safe_name(value: str) -> str:
+    return re.sub(r"[^\w\-.]", "_", value)
+
+
+def libipc_socket_pids(process_name: str, ipc_id: str) -> list[int]:
+    sock_dir = Path(os.environ.get("LIBIPC_SOCK_DIR", "/tmp/libipc"))
+    if not sock_dir.is_dir():
+        return []
+
+    safe_name = libipc_safe_name(process_name)
+    safe_id = libipc_safe_name(ipc_id)
+    pattern = re.compile(rf"^{re.escape(safe_name)}_(\d+)_{re.escape(safe_id)}_.+\.sock$")
+    candidates: list[tuple[float, int]] = []
+    for path in sock_dir.glob(f"{safe_name}_*_{safe_id}_*.sock"):
+        match = pattern.match(path.name)
+        if not match:
+            continue
+        try:
+            pid = int(match.group(1))
+            mtime = path.stat().st_mtime
+        except (OSError, ValueError):
+            continue
+        if process_is_running(pid):
+            candidates.append((mtime, pid))
+
+    candidates.sort(reverse=True)
+    return [pid for _mtime, pid in candidates]
+
+
+def process_is_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
 
 
 def normalize_detection_methods(methods: Any) -> list[str]:
@@ -681,9 +725,12 @@ class ScreenshotMonitor:
     def __init__(self, settings: dict[str, Any], debug: bool = False):
         self.settings = settings
         self.debug = debug
+        self.started_at = datetime.now().astimezone()
         self.notification_center = NotificationCenter(settings, self.log)
         self.processed: dict[str, int] = {}
         self.recent_payloads: set[str] = set()
+        self.daemon_ipc_listener_registered = False
+        self.daemon_ipc_remove_listener = None
         self.clipboardd_subscription_id: str | None = None
         self.clipboardd_listener_registered = False
         self.clipboardd_last_digest: str | None = None
@@ -735,6 +782,8 @@ class ScreenshotMonitor:
             self.log("ERROR", "No screenshot directories exist. Configure watch directories first.")
             return 2
 
+        self._start_daemon_ipc()
+
         active_sources = 0
         if "gio" in detection_methods:
             active_sources += self._start_gio_monitors(valid_dirs)
@@ -747,6 +796,7 @@ class ScreenshotMonitor:
 
         if active_sources == 0:
             self.log("ERROR", "No detection source could be started.")
+            self._stop_daemon_ipc()
             return 2
 
         if self.settings.get("scan_existing_on_start", False):
@@ -774,6 +824,7 @@ class ScreenshotMonitor:
         finally:
             self.log("INFO", "Daemon shutting down")
             self.stop_event.set()
+            self._stop_daemon_ipc()
             self._stop_clipboardd_subscription()
             self.notification_center.close()
             for thread in self.threads:
@@ -842,6 +893,44 @@ class ScreenshotMonitor:
         self.log("INFO", f"Legacy clipboard image polling started at {interval:.2f}s interval")
         return 1
 
+    def _start_daemon_ipc(self) -> bool:
+        try:
+            from oscore.libipc import add_listener, remove_listener
+        except ImportError as error:
+            self.log("INFO", f"Daemon IPC status unavailable because oscore.libipc is missing: {error}")
+            return False
+
+        try:
+            add_listener(DAEMON_PROCESS_NAME, DAEMON_STATUS_IPC_ID, self._on_daemon_status, dict)
+            self.daemon_ipc_listener_registered = True
+            self.daemon_ipc_remove_listener = remove_listener
+            self.log("INFO", f"Daemon IPC status endpoint started: {DAEMON_PROCESS_NAME}/{DAEMON_STATUS_IPC_ID}")
+            return True
+        except Exception as error:
+            self.log("ERROR", f"Daemon IPC status endpoint unavailable: {error}")
+            self._stop_daemon_ipc()
+            return False
+
+    def _stop_daemon_ipc(self) -> None:
+        if self.daemon_ipc_listener_registered and self.daemon_ipc_remove_listener is not None:
+            self.daemon_ipc_listener_registered = False
+            try:
+                self.daemon_ipc_remove_listener(DAEMON_STATUS_IPC_ID)
+            except Exception as error:
+                self.log("ERROR", f"Failed to remove daemon IPC status listener: {error}")
+
+    def _on_daemon_status(self, _from_info, _data: dict) -> dict[str, Any]:
+        return {
+            "ok": True,
+            "app_id": APP_ID,
+            "app_name": APP_NAME,
+            "process_name": DAEMON_PROCESS_NAME,
+            "pid": os.getpid(),
+            "started_at": self.started_at.isoformat(timespec="seconds"),
+            "settings_path": str(settings_path()),
+            "detection_methods": self.settings.get("detection_methods", DEFAULT_DETECTION_METHODS),
+        }
+
     def _start_clipboardd_subscription(self) -> bool:
         try:
             from oscore.libipc import add_listener, remove_listener, send
@@ -887,10 +976,7 @@ class ScreenshotMonitor:
     def _send_clipboardd(self, ipc_id: str, data: dict[str, Any]) -> Any:
         if self.clipboardd_send is None:
             raise RuntimeError("clipboardd send function is not initialized")
-        try:
-            return self.clipboardd_send(CLIPBOARDD_PROCESS_NAME, -1, ipc_id, data, dict, timeout=2.0)
-        except TypeError:
-            return self.clipboardd_send(CLIPBOARDD_PROCESS_NAME, -1, ipc_id, data, dict)
+        return send_libipc_request(self.clipboardd_send, CLIPBOARDD_PROCESS_NAME, ipc_id, data, 2.0)
 
     def _stop_clipboardd_subscription(self) -> None:
         if self.clipboardd_subscription_id and self.clipboardd_send is not None:
@@ -1307,13 +1393,91 @@ def scan_file(path: Path, settings: dict[str, Any], execute: bool) -> int:
     return 0
 
 
+def non_negative_seconds(raw_value: str) -> float:
+    try:
+        seconds = float(raw_value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a number of seconds") from error
+    if seconds < 0:
+        raise argparse.ArgumentTypeError("must be 0 or greater")
+    return seconds
+
+
+def send_libipc_request(
+    send: Callable[..., Any],
+    process_name: str,
+    ipc_id: str,
+    data: dict[str, Any],
+    timeout: float,
+) -> Any:
+    last_error: Exception | None = None
+    for pid in libipc_socket_pids(process_name, ipc_id):
+        try:
+            return send(process_name, pid, ipc_id, data, dict, timeout=timeout)
+        except Exception as error:
+            last_error = error
+
+    try:
+        return send(process_name, -1, ipc_id, data, dict, timeout=timeout)
+    except TypeError:
+        return send(process_name, -1, ipc_id, data, dict)
+    except Exception:
+        if last_error is not None:
+            raise last_error
+        raise
+
+
+def send_clipboardd_probe(send: Callable[..., Any], timeout: float) -> Any:
+    return send_libipc_request(send, CLIPBOARDD_PROCESS_NAME, "get", {}, timeout)
+
+
+def wait_for_clipboardd(timeout_seconds: float) -> bool:
+    if timeout_seconds <= 0:
+        return True
+
+    try:
+        from oscore.libipc import send
+    except ImportError as error:
+        log_event("INFO", f"Skipping clipboardd wait because oscore.libipc is missing: {error}")
+        return False
+
+    deadline = time.monotonic() + timeout_seconds
+    last_error: Exception | None = None
+    log_event("INFO", f"Waiting up to {timeout_seconds:.2f}s for clipboardd: {CLIPBOARDD_PROCESS_NAME}")
+
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+
+        try:
+            send_clipboardd_probe(send, min(0.5, remaining))
+            log_event("INFO", "clipboardd is ready")
+            return True
+        except Exception as error:
+            last_error = error
+
+        time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+
+    detail = f": {last_error}" if last_error is not None else ""
+    log_event("ERROR", f"clipboardd was not ready after {timeout_seconds:.2f}s{detail}")
+    return False
+
+
 def parse_args(args: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Recognize QR codes from GNOME screenshots.")
     parser.add_argument("--scan", metavar="IMAGE", help="scan one image and print the QR content")
     parser.add_argument("--execute", action="store_true", help="perform the configured action with --scan")
     parser.add_argument("--config-path", action="store_true", help="print the shared settings file path")
     parser.add_argument("--write-default-config", action="store_true", help="create the default settings file")
-    parser.add_argument("--install-service", action="store_true", help="install this AppRun bundle as a global user service")
+    parser.add_argument("--install", action="store_true", help="install this AppRun bundle as a global user service")
+    parser.add_argument(
+        "--wait-for-clipboardd",
+        type=non_negative_seconds,
+        default=0.0,
+        metavar="SECONDS",
+        help="wait up to SECONDS for clipboardd before starting the daemon",
+    )
     parser.add_argument("--debug", action="store_true", help="print monitor diagnostics")
     parser.add_argument("--clipboard-watch-helper", action="store_true", help=argparse.SUPPRESS)
     return parser.parse_args(args)
@@ -1324,7 +1488,6 @@ def main(args: list[str]) -> int:
     if parsed.clipboard_watch_helper:
         return clipboard_watch_helper()
 
-    context = AppContext()
 
     if parsed.config_path:
         print(settings_path())
@@ -1336,8 +1499,12 @@ def main(args: list[str]) -> int:
         print(settings_path())
         return 0
 
-    if parsed.install_service:
-        return 0 if context.install_as_global_user("simple", after=["graphical-session.target"]) else 1
+    if parsed.install:
+        ctx = AppContext()
+        ctx.install_as_gui_startup(globally=True, run_args=["--wait-for-clipboardd=10"], start=True)
+        from time import sleep
+        sleep(1)
+        sys.exit()
 
     settings = load_settings()
 
@@ -1345,6 +1512,9 @@ def main(args: list[str]) -> int:
         log_event("INFO", f"Manual scan requested: {parsed.scan}")
         log_event("INFO", f"Effective settings: {compact_json(settings)}")
         return scan_file(Path(parsed.scan).expanduser(), settings, parsed.execute)
+
+    if parsed.wait_for_clipboardd > 0:
+        wait_for_clipboardd(parsed.wait_for_clipboardd)
 
     log_event("INFO", f"AppContext: {context}")
     try:
